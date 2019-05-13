@@ -177,7 +177,7 @@ void sendString(const char* str)
         str++;
     }
 }
-void sendBuf(const void* aBuf, uint16_t buflen)
+void sendBuf(const void* aBuf, uint32_t buflen)
 {
     uint8_t* buf = (uint8_t*)aBuf;
     for(const uint8_t* end = buf + buflen; buf < end; buf++)
@@ -302,7 +302,7 @@ uint8_t recvBufTimeout(void* aBuf, uint16_t bufsize)
     for (; buf < bufEnd; buf++) {
         uint16_t ret = recvByteTimeout();
         if (ret > 255) {
-            LOG("rbt: error after recv %u bytes", (uint32_t)buf - (uint32_t)aBuf);
+            LOG("rbt: error after recv %lu bytes", (uint32_t)buf - (uint32_t)aBuf);
             return ret >> 8;
         }
         *buf = ret & 0xff;
@@ -374,18 +374,19 @@ void sendDeviceInfo(uint8_t cmd) {
 
 uint8_t handleWriteData()
 {
-    assert(sizeof(struct WriteChunkHeader) == 8);
-    struct WriteChunkHeader* hdr = alloca(kMaxRecvBufSize + sizeof(struct WriteChunkHeader));
-    if (!hdr) {
-        return ERR_NOMEM;
-    }
-    uint8_t err = recvBufTimeout(hdr, sizeof(struct WriteChunkHeader));
+    assert(sizeof(struct WriteChunkHeader) == 12);
+    struct WriteChunkPacket packet;
+    uint8_t err = recvBufTimeout(&packet.header, sizeof(packet.header));
     if (err) {
         return err;
     }
-    uint32_t writeAddr = hdr->startAddr;
-    uint16_t dataSize = hdr->dataSize;
-    LOG("received CMD_WRITE_DATA: startAddr = %08lx, size = %u, writeId = %u", writeAddr, dataSize, hdr->writeId);
+    if (calculateBufCRC(&packet, sizeof(packet.header)-4) != packet.header.crc) {
+        LOG("Error verifying packet header CRC");
+        return ERR_CRC;
+    }
+    uint32_t writeAddr = packet.header.startAddr;
+    uint16_t dataSize = packet.header.dataSize;
+    //LOG("received CMD_WRITE_DATA: startAddr = %08lx, size = %u, writeId = %lu", writeAddr, dataSize, hdr->writeId);
 
     if (writeAddr & 0b11) {
         return ERR_ADDR;
@@ -403,25 +404,24 @@ uint8_t handleWriteData()
             return ERR_ADDR;
         }
     }
-    err = recvBufTimeout(hdr->data, dataSize);
+    err = recvBufTimeout(packet.data, dataSize);
     if (err) {
         LOG("Error receiving chunk data: %02x", err);
         return err;
     }
     uint32_t crc;
-    err = recvBufTimeout((uint8_t*)&crc, sizeof(crc));
+    err = recvBufTimeout(&crc, sizeof(crc));
     if (err) {
         return err;
     }
-    LOG("received CRC = 0x%08lx", crc);
-    if (calculateBufCRC(hdr, sizeof(struct WriteChunkHeader) + dataSize) != crc) {
+    if (calculateBufCRC(packet.data, dataSize) != crc) {
         return ERR_CRC;
     }
 
     uint16_t pageSize = flashGetPageSize();
     uint16_t* wptr = (uint16_t*)writeAddr;
-    uint16_t* writeEnd = (uint16_t*)(writeAddr + hdr->dataSize);
-    uint16_t* rptr = (uint16_t*)hdr->data;
+    uint16_t* writeEnd = (uint16_t*)(writeAddr + dataSize);
+    uint16_t* rptr = packet.data;
 
     flashUnlockWrite();
     err = flashErasePage(wptr);
@@ -433,7 +433,13 @@ uint8_t handleWriteData()
     }
 
     while(wptr < writeEnd) {
-        *wptr = *rptr;
+        flash_program_half_word((size_t)wptr, *rptr);
+        if (*wptr != *rptr) {
+            flashLockWrite();
+            LOG("Write verify error at byte %lu: expected %02x, got %02x",
+                (size_t)wptr - writeAddr, *rptr, *wptr);
+            return ERR_VERIFY;
+        }
         wptr++;
         rptr++;
         if (((size_t)wptr % pageSize) == 0) {
@@ -443,22 +449,19 @@ uint8_t handleWriteData()
                 return err;
             } else {
                 LOG("Erased flash page at %p", wptr);
+                sendByte(CMD_WRITE_PAGE_ACK);
             }
         }
     }
     flashLockWrite();
-    wptr = (uint16_t*)writeAddr;
-    rptr = (uint16_t*)hdr->data;
-    for (; wptr < writeEnd; wptr++, rptr++) {
-        if (*rptr != *wptr) {
-            LOG("Write verify error");
-            return ERR_VERIFY;
-        }
+    // just in case, verify written data by CRC
+    if (calculateBufCRC((void*)writeAddr, dataSize) != crc) {
+        LOG("Error verifying CRC of written data");
+        return ERR_CRC;
     }
-    LOG("Write success, ACK-ing");
     // ack the write
     sendByte(CMD_WRITE_DATA);
-    sendBuf(&hdr->writeId, sizeof(hdr->writeId));
+    sendBuf(&packet.header.id, sizeof(packet.header.id));
     return 0;
 }
 void ledOff()
@@ -508,7 +511,7 @@ void deinitDevice()
     SCS_DEMCR &= ~SCS_DEMCR_TRCENA;
 }
 
-void binExec (uint32_t addr){
+void binExec(uint32_t addr){
     SCB_VTOR = addr;
     __asm__ (
     "mov   r1, r0        \n"
@@ -560,7 +563,19 @@ uint8_t handleCmdBoot() {
     jumpToUserProgram(0);
     return 0; // never executed
 }
-
+uint8_t handleCmdDump() {
+    struct ChunkInfo info;
+    recvBufTimeout(&info, sizeof(info));
+    if (calculateBufCRC(&info, sizeof(info) - sizeof(info.crc)) != info.crc) {
+        return ERR_CRC;
+    }
+    sendByte(CMD_DUMP);
+    sendBuf(&info.id, sizeof(info.id));
+    sendBuf((void*)info.startAddr, info.dataSize);
+    uint32_t crc = calculateBufCRC((void*)info.startAddr, info.dataSize);
+    sendBuf(&crc, sizeof(crc));
+    return 0;
+}
 void recvAndProcessCommand()
 {
     uint8_t cmd = recvByte();
@@ -587,18 +602,20 @@ void recvAndProcessCommand()
         }
         break;
     case CMD_DEVICEINFO:
-        LOG("received CMD_DEVICEINFO, responding");
         sendDeviceInfo(CMD_DEVICEINFO);
         break;
+    case CMD_DUMP:
+        handleCmdDump();
+        return;
     default:
         err = ERR_UNKNOWN;
-        //LOG("Unknown command %02x", cmd);
+        LOG("Unknown command %02x", cmd);
         break;
     }
     if (err) {
         sendByte(cmd | CMD_FLAG_NACK);
         sendByte(err);
-        LOG("sent error: nack %02x, errcode: %02x", cmd | CMD_FLAG_NACK, err);
+        LOG("sent error: nack %02x, errcode: %02x", cmd, err);
     }
 }
 

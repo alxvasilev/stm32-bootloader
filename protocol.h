@@ -26,9 +26,11 @@ enum {
     CMD_BOOT = 0x04,
     CMD_SESSION = 0x05,
     CMD_DEVICEINFO = 0x06,
+    CMD_WRITE_PAGE_ACK = 0x07,
+    CMD_DUMP = 0x08,
     CMD_FLAG_NACK = 0x80
 };
-enum { kMaxRecvBufSize = 128 };
+enum { kMaxRecvBufSize = 10240 };
 struct DeviceInfo {
     uint16_t bldrVersion;
     uint16_t chipId;
@@ -41,12 +43,18 @@ struct DeviceInfo {
     uint32_t crc;
 };
 
-struct WriteChunkHeader
+struct ChunkInfo
 {
     uint32_t startAddr;
-    uint16_t writeId;
-    uint16_t dataSize;
-    uint8_t data[];
+    uint32_t dataSize;
+    uint16_t id;
+    uint16_t reserved;
+    uint32_t crc;
+};
+struct WriteChunkPacket
+{
+    struct ChunkInfo header;
+    uint16_t data[kMaxRecvBufSize / 2];
 };
 
 #endif // PROTOCOL_H

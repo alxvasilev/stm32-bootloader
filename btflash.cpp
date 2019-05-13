@@ -144,7 +144,7 @@ void recvBufTimeout(void* aBuf, int bufsize, const char* operation)
         int n = read(ttyFd, buf, bufsize);
         if (n < 0) {
             if (errno == EAGAIN) {
-                usleep(100);
+                usleep(1000);
                 continue;
             } else {
                 throwErrno(operation, "read");
@@ -156,6 +156,8 @@ void recvBufTimeout(void* aBuf, int bufsize, const char* operation)
                 assert(bufsize == 0);
                 return;
             }
+        } else {
+            usleep(1000);
         }
     }
 }
@@ -174,10 +176,9 @@ void sendByte(uint8_t byte, const char* op)
 void sendBuf(const void* aBuf, size_t bufsize, const char* op)
 {
     uint8_t* buf = (uint8_t*)aBuf;
-    for (;;) {
-        size_t writeSize = std::min((size_t)32, bufsize);
-        int ret = write(ttyFd, buf, writeSize);
-        printf("send %d\n", ret);
+    for (;;)
+    {
+        int ret = write(ttyFd, buf, bufsize);
         if (ret > 0) {
             if (ret == bufsize) {
                 return;
@@ -188,7 +189,7 @@ void sendBuf(const void* aBuf, size_t bufsize, const char* op)
         } else if ((ret < 0) && (errno != EAGAIN)) {
             throwErrno(op, "write");
         }
-        usleep(1000000);
+        usleep(10000);
     }
 }
 
@@ -363,13 +364,14 @@ void handshake()
     recvDeviceInfo();
 }
 
-void sendBootCommand(uint32_t addr)
+void sendBootCommand()
 {
-    uint8_t buf[8];
-    buf[0] = 0x04; // CMD_BOOT
-    memcpy(buf+1, &addr, sizeof(addr));
-    write(ttyFd, buf, 1 + sizeof(addr));
+    printf("Booting device...");
+    sendByte(CMD_BOOT, "send CMD_BOOT");
+    while (recvByteTimeout("recv CMD_BOOT ack") != CMD_BOOT);
+    printf("acknowledged\n");
 }
+
 void handleWriteCommand(const char* fname, uint32_t addr)
 {
     if (addr != gDeviceInfo.appFlashAddr) {
@@ -381,10 +383,10 @@ void handleWriteCommand(const char* fname, uint32_t addr)
         perror("Open firmware file");
         return;
     }
-    WriteChunkHeader* hdr = (WriteChunkHeader*)alloca(sizeof(WriteChunkHeader) + kMaxRecvBufSize);
+    WriteChunkPacket packet;
     for(int id = 0;; id++) {
         enum { kReadSize = kMaxRecvBufSize };
-        int n = read(fd, hdr->data, kReadSize);
+        int n = read(fd, packet.data, kReadSize);
         if (n < 0) {
             perror("read firmware file");
             goto cleanup;
@@ -392,20 +394,27 @@ void handleWriteCommand(const char* fname, uint32_t addr)
         if (n == 0) {
             goto cleanup;
         }
-        hdr->dataSize = n;
-        printf("chunk size: %u\n", n);
-        hdr->startAddr = addr;
-        hdr->writeId = id;
-        uint32_t crc = calculateBufCRC(hdr, sizeof(WriteChunkHeader) + n);
-        printf("sent CRC: 0x%08x\n", crc);
+        packet.header.dataSize = n;
+        packet.header.startAddr = addr;
+        packet.header.id = id;
+        packet.header.crc = calculateBufCRC(&packet, sizeof(packet.header)-sizeof(packet.header.crc));
+        uint32_t dataCrc = calculateBufCRC(packet.data, n);
         sendByte(CMD_WRITE_DATA, "send CMD_WRITE_DATA");
-        usleep(1000000);
-        sendBuf(hdr, sizeof(WriteChunkHeader) + n, "Send write chunk data");
-        sendBuf(&crc, sizeof(crc), "send write chunk CRC");
-        while (recvByteTimeout("recv CMD_WRITE_DATA ack") != CMD_WRITE_DATA);
+        sendBuf(&packet, sizeof(packet.header) + n, "Send write chunk data");
+        sendBuf(&dataCrc, sizeof(dataCrc), "send write chunk CRC");
+        for (;;) {
+            auto ch = recvByteTimeout("recv CMD_WRITE_DATA ack");
+            if (ch == CMD_WRITE_PAGE_ACK) {
+                printf(".");
+                fflush(stdout);
+            } else if (ch == CMD_WRITE_DATA) {
+                break;
+            }
+        }
+        printf("\n");
         uint16_t writeId;
         recvBufTimeout(&writeId, sizeof(writeId), "recv write id");
-        if (writeId != hdr->writeId) {
+        if (writeId != packet.header.id) {
             printf("Write id doesn't match in the write ACK response");
             goto cleanup;
         }
@@ -418,6 +427,49 @@ void handleWriteCommand(const char* fname, uint32_t addr)
 cleanup:
         close(fd);
 }
+void handleDumpCommand(const char* fname, uint32_t addr, uint32_t size)
+{
+    ChunkInfo info;
+    info.startAddr = addr;
+    info.dataSize = size;
+    info.id = 0;
+    info.crc = calculateBufCRC(&info, sizeof(info) - sizeof(info.crc));
+    sendByte(CMD_DUMP, "recv CMD_DUMP");
+    sendBuf(&info, sizeof(info), "send CMD_DUMP parameters");
+    auto ch = recvByteTimeout("recv CMD_DUMP reply");
+    if (ch != CMD_DUMP) {
+        throw std::runtime_error("Invalid response received to CMD_DUMP");
+    }
+    uint16_t dumpId;
+    recvBufTimeout(&dumpId, sizeof(dumpId), "recv id from CMD_DUMP response");
+    if (dumpId != 0) {
+        throw std::runtime_error("Received dump id mismatch");
+    }
+    void* buf = alloca(size);
+    if (!buf) {
+        throw std::runtime_error("Error allocating receive buf");
+    }
+    printf("Receiving data....\n");
+    recvBufTimeout(buf, size, "Recv CMD_DUMP data");
+    printf("Received data\n");
+    uint32_t crc;
+    recvBufTimeout(&crc, sizeof(crc), "Recv CMD_DUMP CRC");
+    if (calculateBufCRC(buf, size) != crc) {
+        throw std::runtime_error("Dump data CRC verification failed");
+    }
+    int fd = open(fname, O_WRONLY | O_TRUNC | O_CREAT, 0644);
+    if (fd < 0) {
+        throw std::runtime_error("Error opening '" + std::string(fname) + "' file for writing");
+    }
+    int ret = write(fd, buf, size);
+    close(fd);
+    if (ret < 0) {
+        throwErrno("Write dump to file", "write");
+    } else if (ret < size) {
+        throw std::runtime_error("Wrote less bytes " + std::to_string(ret) + " to dump file");
+    }
+}
+
 int main(int argc, char* argv[])
 {
     printf("===========================================================\n"
@@ -453,22 +505,35 @@ int main(int argc, char* argv[])
     }
     // device is ready to receive commands
     if (command == "boot") {
-        printf("Booting device...");
-        sendByte(CMD_BOOT, "send CMD_BOOT");
-        while (recvByteTimeout("recv CMD_BOOT ack") != CMD_BOOT);
-        printf("acknowledged\n");
+        sendBootCommand();
     } else if (command == "write") {
-        if (argc < 3) {
+        if (argc < 4) {
             printf("No filename specified\n");
             return 1;
         }
-        if (argc < 4) {
+        if (argc < 5) {
             printf("No offset specified\n");
             return 1;
         }
         uint32_t offset = strtoul(argv[4], NULL, 16);
-        printf("Sending firmware file '%s' for writing at offset %08x\n", argv[3], offset);
+        printf("Sending firmware file '%s' for writing at offset %08x\n", basename(argv[3]), offset);
+        gRecvTimeoutMs = 4000;
         handleWriteCommand(argv[3], offset);
+        if (argc >= 6 && argv[5] == std::string("boot")){
+            sendBootCommand();
+        }
+    } else if (command == "dump") {
+        if (argc < 4) {
+            printf("No filename specified\n");
+            return 1;
+        }
+        if (argc < 5) {
+            printf("No address specified\n");
+            return 1;
+        }
+        uint32_t size = (argc < 6) ? 0 : strtoul(argv[5], NULL, 10);
+        uint32_t addr = strtoul(argv[4], NULL, 16);
+        handleDumpCommand(argv[3], addr, size);
     }
     } catch(std::exception& e) {
         printf("Error: %s\n", e.what());
