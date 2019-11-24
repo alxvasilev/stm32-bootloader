@@ -11,9 +11,10 @@
 #include <libopencm3/stm32/desig.h>
 #include <libopencm3/stm32/crc.h>
 #include <string.h>
+#include <stdlib.h>
 #include "protocol.h"
 
-#define DEBUG_LOGGING
+//#define DEBUG_LOGGING
 
 #ifdef DEBUG_LOGGING
     #include <stdio.h>
@@ -145,10 +146,12 @@ static void usart_setup(void)
     gpio_set_mode(GPIOA, GPIO_MODE_INPUT,
         GPIO_CNF_INPUT_PULL_UPDOWN, GPIO_USART1_RX);
 
+    gpio_set(GPIOA, GPIO_USART1_RX);
+
 	/* Setup UART parameters. */
-    usart_set_baudrate(USART1, 38400);
+    usart_set_baudrate(USART1, BOOTLOADER_UART_BITRATE);
     usart_set_databits(USART1, 9);
-    usart_set_stopbits(USART1, USART_STOPBITS_2);
+    usart_set_stopbits(USART1, USART_STOPBITS_1);
     usart_set_mode(USART1, USART_MODE_TX_RX);
     usart_set_parity(USART1, USART_PARITY_EVEN);
     usart_set_flow_control(USART1, USART_FLOWCONTROL_NONE);
@@ -302,7 +305,7 @@ uint8_t recvBufTimeout(void* aBuf, uint16_t bufsize)
     for (; buf < bufEnd; buf++) {
         uint16_t ret = recvByteTimeout();
         if (ret > 255) {
-            LOG("rbt: error after recv %lu bytes", (uint32_t)buf - (uint32_t)aBuf);
+            LOG("recvButTimeout: error after recv %lu bytes", (uint32_t)buf - (uint32_t)aBuf);
             return ret >> 8;
         }
         *buf = ret & 0xff;
@@ -569,13 +572,66 @@ uint8_t handleCmdDump() {
     if (calculateBufCRC(&info, sizeof(info) - sizeof(info.crc)) != info.crc) {
         return ERR_CRC;
     }
+    if ((info.dataSize == 0) || ((info.dataSize + info.startAddr) > (uint32_t)__FLASH_WRITABLE_END_ADDR)) {
+        return ERR_SIZE;
+    }
     sendByte(CMD_DUMP);
     sendBuf(&info.id, sizeof(info.id));
     sendBuf((void*)info.startAddr, info.dataSize);
     uint32_t crc = calculateBufCRC((void*)info.startAddr, info.dataSize);
     sendBuf(&crc, sizeof(crc));
+    LOG("Dump complete");
     return 0;
 }
+void handleCmdSetUart() {
+    uint32_t baudrate;
+    if (recvBufTimeout(&baudrate, sizeof(baudrate))) {
+        LOG("Timed out receiving baud rate");
+        return;
+    }
+    usart_disable(USART1);
+    usart_set_baudrate(USART1, 38400);
+    usart_set_parity(USART1, USART_PARITY_NONE);
+    usart_set_databits(USART1, 9);
+    usart_set_stopbits(USART1, USART_STOPBITS_1);
+    usart_set_mode(USART1, USART_MODE_TX_RX);
+    usart_set_flow_control(USART1, USART_FLOWCONTROL_NONE);
+    usart_enable(USART1);
+    LOG("Please restart HC-0x module in config mode...");
+    for (int i=60; i>0; i--) {
+        LOG("%d", i);
+    }
+    sendBuf("AT\r\n", 4);
+    char rbuf[16];
+    recvBufTimeout(rbuf, 2);
+    rbuf[2] = 0;
+    LOG("Sent AT, received %s", rbuf);
+
+    char buf[32] = "AT+UART=";
+    itoa(baudrate, buf+8, 10);
+    uint8_t baudLen = strlen(buf+8);
+    strcpy(buf+8+baudLen, ",1,2\r\n");
+    LOG("Sending '%s'", buf);
+    sendBuf(buf, strlen(buf));
+    if (recvBufTimeout(buf, 4)) {
+        LOG("Timed out waiting for response");
+        goto restore;
+    }
+    buf[4] = 0;
+    if (strcmp(buf, "OK")) {
+        LOG("Received non-OK response: %s", buf);
+        goto restore;
+    }
+    sendBuf("AT+UART=?\r\n", 11);
+    recvBufTimeout(buf, 12 + baudLen);
+    buf[12] = 0;
+    LOG("recv: %s", buf);
+restore:
+    usart_disable(USART1);
+    usart_set_baudrate(USART1, BOOTLOADER_UART_BITRATE);
+    usart_set_parity(USART1, USART_PARITY_EVEN);
+}
+
 void recvAndProcessCommand()
 {
     uint8_t cmd = recvByte();
@@ -605,7 +661,10 @@ void recvAndProcessCommand()
         sendDeviceInfo(CMD_DEVICEINFO);
         break;
     case CMD_DUMP:
-        handleCmdDump();
+        err = handleCmdDump();
+        return;
+    case CMD_SETBITRATE:
+        handleCmdSetUart();
         return;
     default:
         err = ERR_UNKNOWN;

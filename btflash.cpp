@@ -15,6 +15,16 @@
 
 enum { kRecvTimeout = 2000 };
 uint16_t gRecvTimeoutMs = kRecvTimeout;
+struct AutoClose
+{
+    int mFd;
+    AutoClose(int fd): mFd(fd){}
+    ~AutoClose() {
+        if (mFd >= 0) {
+            close(mFd);
+        }
+    }
+};
 
 static_assert(sizeof(DeviceInfo) == 24, "");
 DeviceInfo gDeviceInfo;
@@ -32,8 +42,8 @@ int ttyConfig(int fd, int speed, int parity)
     cfsetospeed(&tty, speed);
     cfsetispeed(&tty, speed);
 
-    tty.c_cflag &= ~(CSIZE | PARENB | PARODD | CRTSCTS);      // shut off parity
-    tty.c_cflag |= (CS8 | CSTOPB | CLOCAL | CREAD | parity);// ignore modem controls, enable reading
+    tty.c_cflag &= ~(CSIZE | PARENB | PARODD | CRTSCTS | CSTOPB);      // shut off parity
+    tty.c_cflag |= (CS8 | CLOCAL | CREAD | parity);// ignore modem controls, enable reading
 
     // disable IGNBRK for mismatched speed tests; otherwise receive break
     // as \000 chars
@@ -53,11 +63,23 @@ int ttyConfig(int fd, int speed, int parity)
 }
 int ttyOpen(const char* fname, int speed, int parity)
 {
-    int fd = open(fname, O_RDWR | O_NOCTTY | O_SYNC | O_NDELAY | O_NONBLOCK);
-    if (fd < 0)
-    {
-        perror("Error opening tty file");
-        return -1;
+    int fd;
+    for (;;) {
+        fd = open(fname, O_RDWR | O_NOCTTY | O_SYNC | O_NDELAY | O_NONBLOCK);
+        if (fd < 0)
+        {
+            if (errno == EBUSY) {
+                printf("tty file busy, retrying in 2s...\n");
+                usleep(2000000);
+                continue;
+            }
+            else {
+                perror("Error opening tty file");
+                return -1;
+            }
+        } else {
+            break;
+        }
     }
     if(!isatty(fd)) {
         close(fd);
@@ -383,16 +405,18 @@ void handleWriteCommand(const char* fname, uint32_t addr)
         perror("Open firmware file");
         return;
     }
+    AutoClose ac(fd);
+    int total = 0;
     WriteChunkPacket packet;
     for(int id = 0;; id++) {
-        enum { kReadSize = kMaxRecvBufSize };
+        enum { kReadSize = sizeof(packet.data) };
         int n = read(fd, packet.data, kReadSize);
         if (n < 0) {
             perror("read firmware file");
-            goto cleanup;
+            return;
         }
         if (n == 0) {
-            goto cleanup;
+            return;
         }
         packet.header.dataSize = n;
         packet.header.startAddr = addr;
@@ -411,21 +435,20 @@ void handleWriteCommand(const char* fname, uint32_t addr)
                 break;
             }
         }
-        printf("\n");
         uint16_t writeId;
         recvBufTimeout(&writeId, sizeof(writeId), "recv write id");
         if (writeId != packet.header.id) {
             printf("Write id doesn't match in the write ACK response");
-            goto cleanup;
-        }
-        if (n < kReadSize) {
-            printf("Flash write complete\n");
             return;
         }
+        if (n < kReadSize) {
+            printf("\nFlash write complete\n");
+            return;
+        }
+        total += n;
         addr += n;
+        printf(" %d ", total);
     }
-cleanup:
-        close(fd);
 }
 void handleDumpCommand(const char* fname, uint32_t addr, uint32_t size)
 {
@@ -451,11 +474,13 @@ void handleDumpCommand(const char* fname, uint32_t addr, uint32_t size)
     }
     printf("Receiving data....\n");
     recvBufTimeout(buf, size, "Recv CMD_DUMP data");
-    printf("Received data\n");
+    printf("Received data, receiving CRC....\n");
     uint32_t crc;
     recvBufTimeout(&crc, sizeof(crc), "Recv CMD_DUMP CRC");
     if (calculateBufCRC(buf, size) != crc) {
         throw std::runtime_error("Dump data CRC verification failed");
+    } else {
+        printf("Verified CRC of received data\n");
     }
     int fd = open(fname, O_WRONLY | O_TRUNC | O_CREAT, 0644);
     if (fd < 0) {
@@ -469,6 +494,11 @@ void handleDumpCommand(const char* fname, uint32_t addr, uint32_t size)
         throw std::runtime_error("Wrote less bytes " + std::to_string(ret) + " to dump file");
     }
 }
+void handleSetBitrateCommand(uint32_t bitrate)
+{
+    sendByte(CMD_SETBITRATE, "send CMD_SET_BITRATE");
+    sendBuf(&bitrate, sizeof(bitrate), "send bitrate");
+}
 
 int main(int argc, char* argv[])
 {
@@ -479,9 +509,13 @@ int main(int argc, char* argv[])
         printf("Usage: %s <device> [<command> [args]]\n"
                "<command> can be:\n"
                "boot: boots the user firmware\n\n"
-               "flash <file>: Writes the specified firmware file in .bin format\n"
-               "\tand verifies it\n\n"
-               "dump <file> [size]: Reads the user firmware up to the specified size\n"
+               "flash <file> <offset> [boot]: Writes the specified firmware file\n"
+               "\tin .bin format starting at the specified address, and verifies it\n"
+               "\tThe actual start address of the user application is hardcoded\n"
+               "\tin the bootloader, and the <offset> parameter is used only to verify\n"
+               "\tthat the provided image has the same base address. If 'boot' is specified,\n"
+               "\tthe bootloader boots the user code\n"
+               "dump <offset> <file> <size>: Reads the user firmware up to the specified size\n"
                "\t and saves it to the specified file in .bin format\n\n", argv[0]
                );
         exit(1);
@@ -494,13 +528,13 @@ int main(int argc, char* argv[])
     signal(SIGTERM, term);
     srand(time(NULL));
     try {
-    ttyFd = ttyOpen(ttyName, B38400, PARENB);  // set speed to 57600 bps, 8e1
+    ttyFd = ttyOpen(ttyName, B115200, PARENB);  // set speed to 57600 bps, 8e1
     if (ttyFd < 0) {
         return 1;
     }
+    AutoClose ac(ttyFd);
     handshake();
     if (command.empty()) {
-        close(ttyFd);
         return 0;
     }
     // device is ready to receive commands
@@ -524,16 +558,31 @@ int main(int argc, char* argv[])
         }
     } else if (command == "dump") {
         if (argc < 4) {
-            printf("No filename specified\n");
-            return 1;
-        }
-        if (argc < 5) {
             printf("No address specified\n");
             return 1;
         }
-        uint32_t size = (argc < 6) ? 0 : strtoul(argv[5], NULL, 10);
-        uint32_t addr = strtoul(argv[4], NULL, 16);
-        handleDumpCommand(argv[3], addr, size);
+        if (argc < 5) {
+            printf("No filename specified\n");
+            return 1;
+        }
+        if (argc < 6) {
+            printf("No size specified\n");
+            return 1;
+        }
+        uint32_t size = strtoul(argv[5], NULL, 10);
+        uint32_t addr = strtoul(argv[3], NULL, 16);
+        handleDumpCommand(argv[4], addr, size);
+    } else if (command == "setbr") {
+        if (argc < 4) {
+            printf("No bitrate specified\n");
+            return 1;
+        }
+        uint32_t bitrate = atoi(argv[3]);
+        if (!bitrate) {
+            printf("Invalid bitrate specified\n");
+            return 1;
+        }
+        handleSetBitrateCommand(bitrate);
     }
     } catch(std::exception& e) {
         printf("Error: %s\n", e.what());

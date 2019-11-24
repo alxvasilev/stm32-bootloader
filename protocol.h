@@ -2,6 +2,7 @@
 #define BOOTLOADER_PROTOCOL_H
 
 #include <stdint.h>
+#define BOOTLOADER_UART_BITRATE 115200
 
 enum {
     ERR_ASSERT = 0x01,
@@ -28,6 +29,7 @@ enum {
     CMD_DEVICEINFO = 0x06,
     CMD_WRITE_PAGE_ACK = 0x07,
     CMD_DUMP = 0x08,
+    CMD_SETBITRATE = 0x09,
     CMD_FLAG_NACK = 0x80
 };
 enum { kMaxRecvBufSize = 10240 };
